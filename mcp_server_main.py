@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Denmark Legal Research, Multi-Tier Case Law & Citation Verification MCP Server (dk-legal-mcp)
-Version: 2.0.0 (Live National Legal Archive & Multi-Tier Court Search Engine)
+Version: 2.0.0 (Live National Legal Archive, Honest Citation Verification & Multi-Tier Court Engine)
 Organization: JurisAtlas
 License: MIT
 """
+import argparse
 import asyncio
 import io
 import json
 import logging
 import os
 import re
+import time
 import urllib.parse
 import warnings
 from typing import Any, Dict, List, Optional
@@ -43,6 +45,8 @@ JURISDICTION_NAME = "Denmark"
 LEGISLATION_PORTAL = "https://www.retsinformation.dk"
 CASELAW_PORTAL = "https://domsdatabasen.dk"
 API_MODE = "eu_member_native"
+CITATION_EXAMPLE = "UfR 2024.123 H or LBK nr 100"
+TIER2_LABEL = "High Courts (Østre & Vestre Landsret)"
 
 COURT_HIERARCHY: Dict[str, Any] = {
     "tier_1_first_instance": "24 Byretter (District Courts) & Sø- og Handelsretten (Maritime and Commercial High Court)",
@@ -79,8 +83,10 @@ mcp = FastMCP(
     name="dk-legal-mcp",
     instructions=(
         "Official-source legal research, live national archive search, multi-tier judicial hierarchy "
-        "search (First Instance, Regional/Cantonal/Appellate, and Supreme/Constitutional courts), "
-        "and citation verification MCP server for Denmark (DK)."
+        "search (First Instance, High Courts (Østre & Vestre Landsret), and Supreme/Constitutional courts), "
+        "and honest citation verification MCP server for Denmark (DK). "
+        "Always distinguish 'official_registry_api' matches (VERIFIED_OFFICIAL_RECORD) from "
+        "'web_search_fallback' matches (UNCONFIRMED_WEB_MATCH)."
     ),
 )
 
@@ -118,11 +124,15 @@ def _sync_archive_search(
     sites: List[str],
     extra_keywords: str = "",
     limit: int = 10,
+    warnings_out: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     if DDGS is None:
+        if warnings_out is not None:
+            warnings_out.append("Web archive fallback (ddgs) is not installed in this environment.")
         return []
     results: List[Dict[str, Any]] = []
     seen_urls = set()
+    last_err: Optional[str] = None
 
     clean_q = query.strip()
     first_kw = extra_keywords.split("OR")[0].strip() if extra_keywords else ""
@@ -144,26 +154,25 @@ def _sync_archive_search(
                 "snippet": r.get("body", ""),
                 "is_pdf": href.lower().split("?")[0].endswith(".pdf"),
                 "source": domain or default_source,
+                "source_tier": "web_search_fallback",
             })
             if len(results) >= limit:
                 break
 
-    ddgs_client = DDGS()
-
-    import time
-
     def _query_ddgs(q_str: str, max_res: int) -> List[Dict[str, Any]]:
+        nonlocal last_err
         for attempt in range(3):
             try:
                 items = DDGS().text(q_str, backend="yahoo", max_results=max_res)
                 if items:
                     return items
             except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
                 logger.debug("DDGS yahoo attempt %d: %s", attempt + 1, e)
                 time.sleep(0.4)
         return []
 
-    # Pass 1: Query official national domains directly
+    # Pass 1: Query official national domains directly via indexed web fallback
     if sites:
         for s_dom in sites[:2]:
             if len(results) >= limit:
@@ -177,6 +186,9 @@ def _sync_archive_search(
         q2 = f"{clean_q} {first_kw} {JURISDICTION_NAME}".strip()
         _add_hits(_query_ddgs(q2, min(limit * 2, 12)), "Open Legal Archive")
 
+    if not results and last_err and warnings_out is not None:
+        warnings_out.append(f"Indexed web archive fallback returned an error ({last_err}).")
+
     return results[:limit]
 
 
@@ -185,8 +197,9 @@ async def _live_archive_search(
     sites: List[str],
     extra_keywords: str = "",
     limit: int = 10,
+    warnings_out: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_sync_archive_search, query, sites, extra_keywords, limit)
+    return await asyncio.to_thread(_sync_archive_search, query, sites, extra_keywords, limit, warnings_out)
 
 
 def _decode_bytes_smart(raw_bytes: bytes, content_type: str = "") -> str:
@@ -215,6 +228,7 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
     text_body = ""
     content_type = ""
     status_code = 0
+    fetch_warnings: List[str] = []
 
     if primp is not None:
         try:
@@ -227,6 +241,7 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
             text_body = _decode_bytes_smart(raw_bytes, content_type)
         except Exception as e:
             logger.debug("primp fetch fallback: %s", e)
+            fetch_warnings.append(f"Primary fetch via primp failed ({type(e).__name__}); retrying with httpx.")
 
     if not raw_bytes:
         try:
@@ -244,6 +259,10 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
                 text_body = _decode_bytes_smart(raw_bytes, content_type)
         except Exception as e:
             logger.debug("httpx fetch fallback: %s", e)
+            fetch_warnings.append(f"Direct HTTP fetch failed ({type(e).__name__}: {e}).")
+
+    if status_code >= 400:
+        fetch_warnings.append(f"Source portal returned HTTP {status_code} for {target_url}.")
 
     is_pdf = (
         target_url.lower().split("?")[0].endswith(".pdf")
@@ -264,6 +283,7 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
             "pdf_pages": len(reader.pages),
             "status_code": status_code,
             "text": full_text[:100000],
+            "warnings": fetch_warnings,
         }
 
     cleaned = _clean_html(text_body, max_chars=80000) if text_body else ""
@@ -274,11 +294,12 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
                 p_doc = _sync_fetch_document(pdf_links[0])
                 if p_doc.get("text"):
                     cleaned = f"{cleaned}\n\n=== [Attached Official Judgment PDF: {pdf_links[0]}] ===\n{p_doc['text']}"
-            except Exception:
-                pass
+            except Exception as e:
+                fetch_warnings.append(f"Could not extract attached judgment PDF ({type(e).__name__}).")
     if len(cleaned) < 150 or "Just a moment..." in cleaned:
-        fallback_hits = _sync_archive_search(target_url, [], "", limit=5)
+        fallback_hits = _sync_archive_search(target_url, [], "", limit=5, warnings_out=fetch_warnings)
         if fallback_hits:
+            fetch_warnings.append("Direct page returned minimal or bot-gated content; supplemented with web search excerpts.")
             excerpts = "\n\n".join(
                 f"### {h.get('title', '')}\n- URL: {h.get('url', '')}\n- Excerpt: {h.get('snippet', '')}"
                 for h in fallback_hits
@@ -289,13 +310,15 @@ def _sync_fetch_document(target_url: str) -> Dict[str, Any]:
         "format": "HTML/XML",
         "status_code": status_code,
         "text": cleaned,
+        "warnings": fetch_warnings,
     }
 
 
 @mcp.tool(
     description=(
         "Search Denmark (DK) national legislation (statutes, acts, codes, regulations, official gazette) "
-        "via Retsinformation Open Data API (retsinformation.dk) and live national legal archives."
+        "via Retsinformation Open Data API (retsinformation.dk) and live national legal archives. Each result includes 'source_tier' "
+        "('official_registry_api' vs 'web_search_fallback') and any portal issues appear in 'warnings'."
     )
 )
 async def search_legislation(
@@ -307,6 +330,7 @@ async def search_legislation(
     limit = limit if isinstance(limit, int) else 10
     client = get_client()
     results: List[Dict[str, Any]] = []
+    warnings_list: List[str] = []
 
     try:
         if API_MODE == "uk_native":
@@ -326,12 +350,14 @@ async def search_legislation(
                         "summary": sum_el.get_text(strip=True) if sum_el else "",
                         "url": id_el.get_text(strip=True) if id_el else "",
                         "source": "legislation.gov.uk",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official UK Legislation API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "us_native":
             seen_usc = set()
             usc_target = max(1, (limit + 1) // 2)
-            # 1. Direct U.S.C. citation lookup on https://uscode.house.gov
             cit_m = re.search(
                 r"\b(\d{1,2})\s*(?:U\.?S\.?C\.?|United States Code|Title)\s*(?:§+|sec(?:tion|\.)?)?\s*([0-9A-Za-z\-]+)",
                 query,
@@ -350,10 +376,12 @@ async def search_legislation(
                         "url": direct_usc_url,
                         "snippet": _clean_html(usc_resp.text, 500),
                         "source": "uscode.house.gov",
+                        "source_tier": "official_registry_api",
                     })
                     seen_usc.add(direct_usc_url)
+                else:
+                    warnings_list.append(f"uscode.house.gov returned HTTP {usc_resp.status_code} for {t_num} U.S.C. § {s_num}.")
 
-            # 2. Live scan of https://uscode.house.gov/browse.html & browse-tree HTML
             if len(results) < usc_target:
                 b_resp = await client.get("https://uscode.house.gov/browse.html")
                 if b_resp.status_code == 200:
@@ -384,13 +412,15 @@ async def search_legislation(
                                             "url": h_url,
                                             "snippet": f"{sum_txt} -> {sec_txt}",
                                             "source": "uscode.house.gov/browse.html",
+                                            "source_tier": "official_registry_api",
                                         })
                                         if len(results) >= usc_target:
                                             break
                         if len(results) >= usc_target:
                             break
+                else:
+                    warnings_list.append(f"uscode.house.gov browse index returned HTTP {b_resp.status_code}.")
 
-            # 3. Electronic Code of Federal Regulations (eCFR REST API)
             params = {"query": query, "per_page": max(2, limit - len(results)), "page": 1}
             resp = await client.get("https://www.ecfr.gov/api/search/v1/results", params=params)
             if resp.status_code == 200:
@@ -406,7 +436,10 @@ async def search_legislation(
                         "snippet": _clean_html(item.get("full_text_excerpt", ""), 500),
                         "date": item.get("starts_on"),
                         "source": "ecfr.gov",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official eCFR API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "at_ris_native":
             params = {"Suchworte": query, "DokumenteProSeite": "Ten"}
@@ -429,7 +462,10 @@ async def search_legislation(
                         "citation": bund.get("Kundmachungsorgan", ""),
                         "url": bund.get("GesamteRechtsvorschriftUrl", ""),
                         "source": "data.bka.gv.at (RIS)",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official Austrian RIS API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "pl_native":
             params = {"title": query, "limit": limit}
@@ -446,7 +482,10 @@ async def search_legislation(
                         "promulgation": item.get("promulgation", ""),
                         "url": f"https://api.sejm.gov.pl/eli/acts/{item.get('ELI', '')}",
                         "source": "api.sejm.gov.pl",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official Polish Sejm ELI API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "se_native":
             params = {"sok": query, "doktyp": "sfs", "utformat": "json"}
@@ -462,7 +501,10 @@ async def search_legislation(
                         "date": d.get("datum", ""),
                         "url": "https:" + d.get("dokument_url_html", "") if str(d.get("dokument_url_html", "")).startswith("//") else d.get("dokument_url_html", ""),
                         "source": "data.riksdagen.se",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official Swedish Riksdagen API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "ie_native":
             params = {"limit": 50}
@@ -479,14 +521,16 @@ async def search_legislation(
                             "status": bill.get("status", ""),
                             "url": bill.get("uri", "https://www.irishstatutebook.ie"),
                             "source": "api.oireachtas.ie",
+                            "source_tier": "official_registry_api",
                         })
                         if len(results) >= limit:
                             break
+            else:
+                warnings_list.append(f"Official Oireachtas API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "no_native":
             lovdata_key = os.environ.get("LOVDATA_API_KEY", "").strip()
             if lovdata_key:
-                # Enterprise / Authenticated Lovdata API (/v1/search)
                 ld_resp = await client.get(
                     "https://api.lovdata.no/v1/search",
                     params={"q": query},
@@ -502,9 +546,11 @@ async def search_legislation(
                             "url": hit.get("url") or f"https://lovdata.no/dokument/{ref_id}",
                             "snippet": hit.get("summary") or hit.get("snippet", ""),
                             "source": "api.lovdata.no (/v1/search)",
+                            "source_tier": "official_registry_api",
                         })
+                else:
+                    warnings_list.append(f"Official Lovdata search API returned HTTP {ld_resp.status_code}.")
 
-            # Direct LOV-YYYY-MM-DD-NN citation lookup on lovdata.no
             lov_m = re.search(r"(?:LOV[-/])?(\d{4}-\d{2}-\d{2}-\d+)", query, re.I)
             if lov_m and len(results) < limit:
                 lov_id = lov_m.group(1)
@@ -518,9 +564,9 @@ async def search_legislation(
                         "url": lov_url,
                         "snippet": fetched_lov["text"][:500],
                         "source": "lovdata.no",
+                        "source_tier": "official_registry_api",
                     })
 
-            # Official NLOD 2.0 https://api.lovdata.no/v1/publicData/list
             if len(results) < limit:
                 pub_resp = await client.get("https://api.lovdata.no/v1/publicData/list")
                 if pub_resp.status_code == 200:
@@ -535,7 +581,10 @@ async def search_legislation(
                                 "url": f"https://api.lovdata.no/v1/publicData/get/{fn}",
                                 "lastModified": pkg.get("lastModified", ""),
                                 "source": "api.lovdata.no (/v1/publicData/list)",
+                                "source_tier": "official_registry_api",
                             })
+                else:
+                    warnings_list.append(f"Lovdata publicData API returned HTTP {pub_resp.status_code}.")
 
         elif API_MODE == "de_native":
             params = {"searchTerm": query, "size": limit}
@@ -552,7 +601,10 @@ async def search_legislation(
                         "date": item.get("legislationDate") or item.get("decisionDate", ""),
                         "url": "https://testphase.rechtsinformationen.bund.de" + doc_id if doc_id.startswith("/") else doc_id,
                         "source": "rechtsinformationen.bund.de",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official Rechtsinformationen des Bundes API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "ee_native":
             params = {"lehekylg": 1, "limiit": limit, "pealkiri": query}
@@ -567,10 +619,20 @@ async def search_legislation(
                         "abbreviation": akt.get("lyhend", ""),
                         "url": f"https://www.riigiteataja.ee/akt/{gid}" if gid else "https://www.riigiteataja.ee",
                         "source": "riigiteataja.ee",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Official Riigi Teataja API returned HTTP {resp.status_code}.")
+    except Exception as e:
+        logger.warning("search_legislation official API error: %s", e)
+        warnings_list.append(
+            f"Official legislation portal ({LEGISLATION_PORTAL}) request failed ({type(e).__name__}: {e}); "
+            "attempting indexed archive search fallback."
+        )
 
-        # Live National Legal Archive Search (Primary for non-REST countries & supplementary for all)
-        if len(results) < limit:
+    # Live National Legal Archive Search (Web search fallback — tagged 'web_search_fallback')
+    if len(results) < limit:
+        try:
             leg_sites = ARCHIVE_PROFILE.get("leg_sites", [])
             leg_kw = ARCHIVE_PROFILE.get("leg_keywords", "")
             if year:
@@ -580,10 +642,12 @@ async def search_legislation(
                 sites=leg_sites,
                 extra_keywords=leg_kw,
                 limit=limit - len(results),
+                warnings_out=warnings_list,
             )
             results.extend(archive_hits)
-    except Exception as e:
-        logger.warning("search_legislation error: %s", e)
+        except Exception as e:
+            logger.warning("search_legislation archive fallback error: %s", e)
+            warnings_list.append(f"Archive search fallback failed ({type(e).__name__}: {e}).")
 
     return {
         "jurisdiction": JURISDICTION_NAME,
@@ -592,6 +656,7 @@ async def search_legislation(
         "indexed_domains": ARCHIVE_PROFILE.get("leg_sites", []),
         "query": query,
         "count": len(results),
+        "warnings": warnings_list,
         "results": results,
     }
 
@@ -599,7 +664,8 @@ async def search_legislation(
 @mcp.tool(
     description=(
         "Search Denmark (DK) court decisions and binding precedents via Domsdatabasen (domsdatabasen.dk) & Højesteret (domstol.dk) "
-        "and open national judicial archives (Supported courts: Højesteret (Supreme Court), Landsretterne (Østre & Vestre), Sø- og Handelsretten)."
+        "and open national judicial archives (Supported courts: Højesteret (Supreme Court), Landsretterne (Østre & Vestre), Sø- og Handelsretten). "
+        "Each decision carries 'source_tier' ('official_registry_api' vs 'web_search_fallback')."
     )
 )
 async def search_case_law(
@@ -611,12 +677,12 @@ async def search_case_law(
     limit = limit if isinstance(limit, int) else 10
     client = get_client()
     decisions: List[Dict[str, Any]] = []
+    warnings_list: List[str] = []
 
     try:
         if API_MODE == "uk_native":
             tna_target = max(1, (limit + 1) // 2)
             q_combined = f"{query} {court}".strip()
-            # 1. The National Archives Find Case Law Atom API (caselaw.nationalarchives.gov.uk)
             url = f"https://caselaw.nationalarchives.gov.uk/atom.xml?query={urllib.parse.quote(q_combined)}"
             resp = await client.get(url)
             if resp.status_code == 200:
@@ -631,15 +697,19 @@ async def search_case_law(
                         "url": id_el.get_text(strip=True) if id_el else "",
                         "date": upd_el.get_text(strip=True) if upd_el else "",
                         "source": "caselaw.nationalarchives.gov.uk",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"The National Archives Find Case Law API returned HTTP {resp.status_code}.")
 
-            # 2. Courts and Tribunals Judiciary REST JSON API (https://www.judiciary.uk/wp-json/wp/v2/judgment)
             jud_limit = max(2, limit - len(decisions))
             jud_resp = await client.get(
                 "https://www.judiciary.uk/wp-json/wp/v2/judgment",
                 params={"search": q_combined, "per_page": jud_limit},
             )
             jud_items = jud_resp.json() if jud_resp.status_code == 200 and isinstance(jud_resp.json(), list) else []
+            if jud_resp.status_code != 200:
+                warnings_list.append(f"judiciary.uk REST API returned HTTP {jud_resp.status_code}.")
             if not jud_items and len(q_combined.split()) > 2:
                 short_q = " ".join(q_combined.split()[:2])
                 jud_resp2 = await client.get(
@@ -660,6 +730,7 @@ async def search_case_law(
                     "date": j_item.get("date", ""),
                     "snippet": _clean_html(rendered_html, 500),
                     "source": "judiciary.uk (Courts and Tribunals Judiciary)",
+                    "source_tier": "official_registry_api",
                 })
 
         elif API_MODE == "us_native":
@@ -680,7 +751,10 @@ async def search_case_law(
                         "url": "https://www.courtlistener.com" + str(item.get("absolute_url", "")),
                         "snippet": _clean_html(item.get("snippet", ""), 400),
                         "source": "courtlistener.com",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"CourtListener API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "at_ris_native":
             params = {"Applikation": "Justiz", "Suchworte": query, "DokumenteProSeite": "Ten"}
@@ -706,7 +780,10 @@ async def search_case_law(
                         "ecli": jud.get("EuropeanCaseLawIdentifier", ""),
                         "url": jud.get("DokumentUrl", ""),
                         "source": "data.bka.gv.at (RIS Justiz)",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Austrian RIS Judikatur API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "nl_native":
             params = {"zoekterm": query, "max": limit, "return": "DOC"}
@@ -723,7 +800,10 @@ async def search_case_law(
                         "summary": sum_el.get_text(strip=True) if sum_el else "",
                         "url": f"https://uitspraken.rechtspraak.nl/details?id={id_el.get_text(strip=True) if id_el else ''}",
                         "source": "data.rechtspraak.nl",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Rechtspraak.nl API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "pl_native":
             params = {"all": query, "pageSize": limit}
@@ -740,10 +820,12 @@ async def search_case_law(
                         "url": f"https://www.saos.org.pl/judgments/{item.get('id', '')}",
                         "snippet": _clean_html(item.get("textContent", ""), 400),
                         "source": "saos.org.pl",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"SAOS Polish Case Law API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "ch_native":
-            # Direct JSON-RPC 2.0 integration with official Swiss https://mcp.entscheidsuche.ch/mcp
             canton_map = {
                 "zurich": "ZH", "zürich": "ZH", "zh": "ZH",
                 "bern": "BE", "be": "BE",
@@ -790,10 +872,13 @@ async def search_case_law(
                             "date": h.get("decision_date", ""),
                             "abstract": _clean_html(h.get("abstract") or "", 300),
                             "snippet": _clean_html(h.get("text") or "", 400),
-                            "url": h.get("document_url") or h.get("original_url") or f"https://entscheidsuche.ch",
+                            "url": h.get("document_url") or h.get("original_url") or "https://entscheidsuche.ch",
                             "is_pdf": bool(h.get("is_pdf")),
                             "source": "mcp.entscheidsuche.ch",
+                            "source_tier": "official_registry_api",
                         })
+            else:
+                warnings_list.append(f"Entscheidsuche.ch MCP API returned HTTP {rpc_resp.status_code}.")
 
         elif API_MODE == "de_native":
             params = {"searchTerm": f"{query} {court}".strip(), "size": limit}
@@ -812,7 +897,10 @@ async def search_case_law(
                         "date": item.get("decisionDate", ""),
                         "url": "https://testphase.rechtsinformationen.bund.de" + doc_id if doc_id.startswith("/") else doc_id,
                         "source": "rechtsinformationen.bund.de",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"Rechtsinformationen des Bundes API returned HTTP {resp.status_code}.")
 
         elif API_MODE == "eu_native":
             hudoc_q = f"contentsitename:ECHR AND {query}"
@@ -836,10 +924,20 @@ async def search_case_law(
                         "date": cols.get("kpdate", ""),
                         "url": f"https://hudoc.echr.coe.int/eng?i={iid}" if iid else "https://hudoc.echr.coe.int",
                         "source": "hudoc.echr.coe.int",
+                        "source_tier": "official_registry_api",
                     })
+            else:
+                warnings_list.append(f"ECHR HUDOC API returned HTTP {resp.status_code}.")
+    except Exception as e:
+        logger.warning("search_case_law official API error: %s", e)
+        warnings_list.append(
+            f"Official case-law portal ({CASELAW_PORTAL}) request failed ({type(e).__name__}: {e}); "
+            "attempting indexed archive search fallback."
+        )
 
-        # Live National Judicial Archive Search (Primary for 36 countries + regional/court-specific supplement)
-        if len(decisions) < limit:
+    # Live National Judicial Archive Search (Web search fallback — tagged 'web_search_fallback')
+    if len(decisions) < limit:
+        try:
             case_sites = ARCHIVE_PROFILE.get("case_sites", [])
             court_str = (court if isinstance(court, str) else "").strip()
             extra_kw = court_str if court_str else ARCHIVE_PROFILE.get("case_keywords", "")
@@ -848,10 +946,12 @@ async def search_case_law(
                 sites=case_sites,
                 extra_keywords=extra_kw,
                 limit=limit - len(decisions),
+                warnings_out=warnings_list,
             )
             decisions.extend(archive_decisions)
-    except Exception as e:
-        logger.warning("search_case_law error: %s", e)
+        except Exception as e:
+            logger.warning("search_case_law archive fallback error: %s", e)
+            warnings_list.append(f"Case-law archive search fallback failed ({type(e).__name__}: {e}).")
 
     return {
         "jurisdiction": JURISDICTION_NAME,
@@ -860,6 +960,7 @@ async def search_case_law(
         "indexed_domains": ARCHIVE_PROFILE.get("case_sites", []),
         "query": query,
         "count": len(decisions),
+        "warnings": warnings_list,
         "decisions": decisions,
     }
 
@@ -876,6 +977,8 @@ async def get_legal_document_markdown(
 ) -> Dict[str, Any]:
     page = page if isinstance(page, int) else 1
     target_url = document_id_or_url.strip()
+    warnings_list: List[str] = []
+
     if API_MODE == "ch_native" and not target_url.startswith("http"):
         try:
             client = get_client()
@@ -904,10 +1007,14 @@ async def get_legal_document_markdown(
                         "document_format": "entscheidsuche-mcp JSON-RPC",
                         "current_page": page,
                         "total_pages": total_pages,
+                        "warnings": warnings_list,
                         "markdown_content": full_text[start : start + chunk_size],
                     }
+            else:
+                warnings_list.append(f"Entscheidsuche fetch_document returned HTTP {rpc_resp.status_code}.")
         except Exception as e:
             logger.debug("entscheidsuche fetch_document fallback: %s", e)
+            warnings_list.append(f"Entscheidsuche document API failed ({type(e).__name__}: {e}); trying direct URL fetch.")
 
     if not target_url.startswith("http"):
         if API_MODE == "us_native":
@@ -934,6 +1041,7 @@ async def get_legal_document_markdown(
 
     try:
         fetched = await asyncio.to_thread(_sync_fetch_document, target_url)
+        warnings_list.extend(fetched.get("warnings", []))
         text = fetched.get("text", "")
         chunk_size = 5000
         total_pages = max(1, (len(text) + chunk_size - 1) // chunk_size)
@@ -945,12 +1053,15 @@ async def get_legal_document_markdown(
             "document_format": fetched.get("format", "HTML"),
             "current_page": page,
             "total_pages": total_pages,
+            "warnings": warnings_list,
             "markdown_content": text[start : start + chunk_size],
         }
     except Exception as e:
+        warnings_list.append(f"Document retrieval failed ({type(e).__name__}: {e}).")
         return {
             "jurisdiction": JURISDICTION_NAME,
             "source_url": target_url,
+            "warnings": warnings_list,
             "error": str(e),
         }
 
@@ -958,8 +1069,8 @@ async def get_legal_document_markdown(
 @mcp.tool(
     description=(
         "Return the complete step-by-step multi-tier judicial hierarchy for Denmark (DK): "
-        "Tier 1 (First Instance / Trial / Municipal / District Courts), "
-        "Tier 2 (Regional / Cantonal / County / Appellate Courts), "
+        "Tier 1 (First Instance / Trial Courts), "
+        "Tier 2 (High Courts (Østre & Vestre Landsret)), "
         "Tier 3 (Supreme / Cassation / Constitutional Courts), and all official court sub-portals."
     )
 )
@@ -967,6 +1078,7 @@ async def list_court_hierarchy() -> Dict[str, Any]:
     return {
         "jurisdiction": JURISDICTION_NAME,
         "code": JURISDICTION_CODE,
+        "tier_2_label": TIER2_LABEL,
         "hierarchy": COURT_HIERARCHY,
         "indexed_archive_domains": ARCHIVE_PROFILE.get("case_sites", []),
         "supported_sub_courts": ARCHIVE_PROFILE.get("sub_court_names", {}),
@@ -975,8 +1087,8 @@ async def list_court_hierarchy() -> Dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "Search court decisions in Denmark (DK) filtered by specific judicial tier or regional/cantonal/appellate court. "
-        "Supports Tier 1 (first_instance), Tier 2 (appellate_regional — including Cantonal/Regional/County/Circuit courts), "
+        "Search court decisions in Denmark (DK) filtered by specific judicial tier or sub-court. "
+        "Supports Tier 1 (first_instance), Tier 2 (appellate_regional — High Courts (Østre & Vestre Landsret)), "
         "and Tier 3 (supreme_constitutional), or a specific sub-portal key from list_court_hierarchy."
     )
 )
@@ -984,11 +1096,11 @@ async def search_tiered_court_decisions(
     query: str = Field(..., description="Legal issue, statute article, case number, or keywords."),
     tier: str = Field(
         "appellate_regional",
-        description="Judicial stage: 'first_instance', 'appellate_regional' (Cantonal/Regional/Circuit/Appellate), 'supreme_constitutional', or 'all'.",
+        description="Judicial stage: 'first_instance', 'appellate_regional' (High Courts (Østre & Vestre Landsret)), 'supreme_constitutional', or 'all'.",
     ),
     sub_court: str = Field(
         "",
-        description="Optional specific court/canton/region key (e.g. 'kantonalni_sud_sarajevo', 'kantonalni_sud_odzak_posavski_kanton', 'okruzni_sud_banja_luka', etc.).",
+        description="Optional specific court/sub-portal key from list_court_hierarchy (e.g. 'domsdatabasen_all_tiers').",
     ),
     limit: int = Field(10, ge=1, le=50, description="Maximum number of decisions to return."),
 ) -> Dict[str, Any]:
@@ -1000,6 +1112,7 @@ async def search_tiered_court_decisions(
     selected_portal = COURT_HIERARCHY.get("tiered_database_url", CASELAW_PORTAL)
     matched_sub_court = ""
     native_court_query = ""
+    warnings_list: List[str] = []
 
     if sub_court:
         clean_key = sub_court.strip().lower().replace(" ", "_").replace("-", "_")
@@ -1028,10 +1141,10 @@ async def search_tiered_court_decisions(
     target_kw = native_court_query or tier_kw_map.get(tier, ARCHIVE_PROFILE.get("case_keywords", ""))
 
     decisions: List[Dict[str, Any]] = []
-    # If jurisdiction has a native structured API (e.g., CH mcp.entscheidsuche.ch, DE bund.de, AT RIS, US CourtListener, NL Rechtspraak, PL SAOS, UK National Archives), query it first
     if API_MODE in ("ch_native", "de_native", "at_ris_native", "nl_native", "pl_native", "us_native", "uk_native", "eu_native"):
         base_search = await search_case_law(query=query, court=native_court_query or sub_court or "", limit=limit)
         decisions.extend(base_search.get("decisions", []))
+        warnings_list.extend(base_search.get("warnings", []))
 
     if len(decisions) < limit:
         archive_hits = await _live_archive_search(
@@ -1039,6 +1152,7 @@ async def search_tiered_court_decisions(
             sites=ARCHIVE_PROFILE.get("case_sites", []),
             extra_keywords=target_kw,
             limit=limit - len(decisions),
+            warnings_out=warnings_list,
         )
         seen = {d.get("url") or d.get("id") for d in decisions}
         for d in archive_hits:
@@ -1060,6 +1174,7 @@ async def search_tiered_court_decisions(
         "jurisdiction": JURISDICTION_NAME,
         "code": JURISDICTION_CODE,
         "requested_tier": tier,
+        "tier_2_label": TIER2_LABEL,
         "tier_courts_covered": tier_description,
         "matched_sub_court": matched_sub_court or "all_in_tier",
         "native_court_filter": native_court_query or target_kw,
@@ -1067,15 +1182,17 @@ async def search_tiered_court_decisions(
         "available_sub_portals": sub_portals,
         "query": query,
         "count": len(decisions),
+        "warnings": warnings_list,
         "decisions": decisions,
     }
 
 
 @mcp.tool(
     description=(
-        "No-Hallucination Citation Verifier for Denmark (DK). "
+        "Honest Citation Verifier for Denmark (DK). "
         "Validates format and live existence of legal citations (e.g., 'UfR 2024.123 H or LBK nr 100') "
-        "against official Denmark and ECLI/ELI registries to prevent AI-hallucinated citations."
+        "and clearly distinguishes official registry API hits (VERIFIED_OFFICIAL_RECORD) "
+        "from web search fallback hits (UNCONFIRMED_WEB_MATCH) or missing records (NOT_FOUND)."
     )
 )
 async def verify_citation(
@@ -1087,21 +1204,133 @@ async def verify_citation(
     leg_check = await search_legislation(query=clean_cit, year=None, limit=3)
 
     matches = case_check.get("decisions", []) + leg_check.get("results", [])
-    verified = len(matches) > 0
+    warnings_list = case_check.get("warnings", []) + leg_check.get("warnings", [])
+    official_matches = [m for m in matches if m.get("source_tier") == "official_registry_api"]
+    web_matches = [m for m in matches if m.get("source_tier") != "official_registry_api"]
+
+    if official_matches:
+        status = "VERIFIED_OFFICIAL_RECORD"
+        verified_official = True
+        verification_tier = "official_registry_api"
+        disclaimer = (
+            "Matched in a structured official legal registry API. "
+            "Always confirm current consolidated status on the official gazette before relying on it."
+        )
+        ordered_matches = (official_matches + web_matches)[:5]
+    elif web_matches:
+        status = "UNCONFIRMED_WEB_MATCH"
+        verified_official = False
+        verification_tier = "web_search_fallback"
+        disclaimer = (
+            "Matched ONLY via web search fallback — NOT confirmed by a structured official registry API. "
+            "Manually verify this citation directly on the official portal before citing it."
+        )
+        ordered_matches = web_matches[:5]
+    else:
+        status = "NOT_FOUND"
+        verified_official = False
+        verification_tier = "none"
+        disclaimer = (
+            "No matching record was returned. Check citation formatting or verify manually on the official portal."
+        )
+        ordered_matches = []
 
     return {
         "jurisdiction": JURISDICTION_NAME,
+        "code": JURISDICTION_CODE,
         "citation": clean_cit,
         "is_valid_ecli_syntax": is_ecli,
-        "verified_in_official_registry": verified,
+        "verified_in_official_registry": verified_official,
+        "verification_tier": verification_tier,
+        "official_match_count": len(official_matches),
+        "web_fallback_match_count": len(web_matches),
         "match_count": len(matches),
-        "matches": matches[:3],
-        "status": "VERIFIED_OFFICIAL_RECORD" if verified else "UNVERIFIED_CHECK_MANUALLY",
+        "matches": ordered_matches,
+        "status": status,
+        "disclaimer": disclaimer,
+        "warnings": warnings_list,
     }
 
 
+@mcp.prompt(
+    name="verify_citations_in_draft",
+    description="Extract and verify every Denmark (DK) statute and case citation in a draft legal document.",
+)
+def verify_citations_in_draft(draft_text: str) -> str:
+    return (
+        f"You are verifying legal citations for **{JURISDICTION_NAME} ({JURISDICTION_CODE})**.\n\n"
+        f"1. Extract every statute, code article, regulation, and court decision citation from the draft below "
+        f"(for example formats like `{CITATION_EXAMPLE}`).\n"
+        f"2. Call `verify_citation` for each extracted citation.\n"
+        f"3. Present a clear verification table with columns: Citation | Status (`VERIFIED_OFFICIAL_RECORD`, "
+        f"`UNCONFIRMED_WEB_MATCH`, or `NOT_FOUND`) | Source Tier | Official URL | Notes/Warnings.\n"
+        f"4. Flag any `UNCONFIRMED_WEB_MATCH` or `NOT_FOUND` item for mandatory manual check on "
+        f"{LEGISLATION_PORTAL} or {CASELAW_PORTAL}.\n\n"
+        f"Draft text to verify:\n---\n{draft_text}\n---"
+    )
+
+
+@mcp.prompt(
+    name="research_statute_and_precedent",
+    description="Research applicable Denmark (DK) legislation and multi-tier court precedent for a legal issue.",
+)
+def research_statute_and_precedent(legal_issue: str) -> str:
+    return (
+        f"Research the following legal issue under **{JURISDICTION_NAME} ({JURISDICTION_CODE})** law:\n\n"
+        f"**Issue:** {legal_issue}\n\n"
+        f"Workflow:\n"
+        f"1. Call `search_legislation` for controlling statutes, codes, or regulations.\n"
+        f"2. Call `search_case_law` and `search_tiered_court_decisions` for binding Supreme/Constitutional and "
+        f"{TIER2_LABEL} decisions.\n"
+        f"3. Retrieve key passages with `get_legal_document_markdown` where needed.\n"
+        f"4. Verify every citation you rely on with `verify_citation` (example format: `{CITATION_EXAMPLE}`) and "
+        f"explicitly label each authority's `source_tier` (`official_registry_api` vs `web_search_fallback`) and any tool `warnings`.\n"
+        f"5. Structure the memo into: Applicable Legislation, Key Case Law, Practical Analysis, and Verification Notes."
+    )
+
+
+@mcp.prompt(
+    name="map_court_hierarchy",
+    description="Map the 3-tier court hierarchy and appeal path in Denmark (DK) for a given dispute type.",
+)
+def map_court_hierarchy(dispute_type: str = "civil") -> str:
+    return (
+        f"Map the judicial hierarchy and appeal path in **{JURISDICTION_NAME} ({JURISDICTION_CODE})** "
+        f"for a **{dispute_type}** dispute.\n\n"
+        f"1. Call `list_court_hierarchy` to retrieve the official 3-tier court structure and sub-portals.\n"
+        f"2. Explain the progression from Tier 1 (First Instance) to Tier 2 ({TIER2_LABEL}) to "
+        f"Tier 3 (Supreme & Constitutional Courts).\n"
+        f"3. Run `search_tiered_court_decisions` for a relevant example decision in the appellate tier and "
+        f"include official links plus citation format guidance (e.g., `{CITATION_EXAMPLE}`)."
+    )
+
+
 def main() -> None:
-    mcp.run()
+    parser = argparse.ArgumentParser(
+        description="Denmark Legal Research, Multi-Tier Case Law & Citation Verification MCP Server (dk-legal-mcp)"
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http", "sse"],
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
+        help="MCP transport protocol (default: stdio).",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MCP_HOST", "127.0.0.1"),
+        help="Bind host for streamable-http/sse transport (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("MCP_PORT", "8000")),
+        help="Bind port for streamable-http/sse transport (default: 8000).",
+    )
+    args = parser.parse_args()
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
