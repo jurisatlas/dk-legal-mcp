@@ -42,48 +42,57 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue"
 set "DL_EXIT=%ERRORLEVEL%"
 
-if not "%DL_EXIT%"=="0" (
-    echo.
-    echo ============================================================================
-    echo   Could not download dk-legal-mcp from GitHub (Exit Code: %DL_EXIT%).
-    echo ============================================================================
-    echo   Please check your internet connection or try the unified installer:
-    echo   https://jurisatlas.github.io
-    echo.
-    pause
-    exit /b %DL_EXIT%
-)
+if not "%DL_EXIT%"=="0" goto :dl_fail
+goto :dl_ok
 
+:dl_fail
+echo.
+echo ============================================================================
+echo   Could not download dk-legal-mcp from GitHub (Exit Code: %DL_EXIT%).
+echo ============================================================================
+echo   Please check your internet connection or try the unified installer:
+echo   https://jurisatlas.github.io
+echo.
+pause
+exit /b %DL_EXIT%
+
+:dl_ok
 set "BOOT_PS1="
 for /d %%D in ("%BOOT_EXTRACT%\*") do (
     if exist "%%~fD\gui_installer.ps1" set "BOOT_PS1=%%~fD\gui_installer.ps1"
 )
 if "%BOOT_PS1%"=="" if exist "%BOOT_EXTRACT%\gui_installer.ps1" set "BOOT_PS1=%BOOT_EXTRACT%\gui_installer.ps1"
 
-if "%BOOT_PS1%"=="" (
-    echo.
-    echo Error: Downloaded archive did not contain gui_installer.ps1.
-    pause
-    exit /b 1
-)
+if "%BOOT_PS1%"=="" goto :missing_ps1
+goto :launch_boot
 
+:missing_ps1
+echo.
+echo Error: Downloaded archive did not contain gui_installer.ps1.
+pause
+exit /b 1
+
+:launch_boot
 echo Launching JurisAtlas visual setup window for Denmark...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%BOOT_PS1%"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 :done
-if not "%EXIT_CODE%"=="0" (
-    echo.
-    echo ============================================================================
-    echo   JurisAtlas Installer exited with error code %EXIT_CODE%.
-    echo ============================================================================
-    echo.
-    echo   If your organization blocks PowerShell scripts (ExecutionPolicy / GPO),
-    echo   please use the JurisAtlas unified installer or Claude .mcpb bundle:
-    echo   https://jurisatlas.github.io
-    echo.
-    pause
-    exit /b %EXIT_CODE%
-)
+if not "%EXIT_CODE%"=="0" goto :err_fail
+goto :end_ok
 
+:err_fail
+echo.
+echo ============================================================================
+echo   JurisAtlas Installer exited with error code %EXIT_CODE%.
+echo ============================================================================
+echo.
+echo   If your organization blocks PowerShell scripts (ExecutionPolicy / GPO),
+echo   please use the JurisAtlas unified installer or Claude .mcpb bundle:
+echo   https://jurisatlas.github.io
+echo.
+pause
+exit /b %EXIT_CODE%
+
+:end_ok
 endlocal
